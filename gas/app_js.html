@@ -1,0 +1,434 @@
+<script>
+(function () {
+  'use strict';
+
+  var state = { user: null, company: {}, clients: [], items: [], today: '', quote: { quoteNo: '', ver: 0, status: '' }, closing: null };
+
+  /* ---------- サーバ呼び出し ---------- */
+  function call(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(function (e) { reject(e); });
+      runner[fn].apply(runner, args);
+    });
+  }
+
+  /* ---------- 小道具 ---------- */
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function yen(n) { return Math.round(Number(n) || 0).toLocaleString('ja-JP'); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function clientName(id) { var c = state.clients.filter(function (x) { return x.id === id; })[0]; return c ? c.name : id; }
+  function monthEnd(ymd) { var y = Number(ymd.slice(0, 4)), m = Number(ymd.slice(5, 7)); var d = new Date(y, m, 0); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function errText(e) { var m = (e && e.message) ? e.message : String(e); return m.replace(/^Error:\s*/, ''); }
+
+  var toastTimer = null;
+  function toast(msg, kind) {
+    var t = $('toast'); t.textContent = msg; t.className = 'toast ' + (kind || '');
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.classList.add('hidden'); }, 2600);
+  }
+  function showAlert(id, msg, kind) { var a = $(id); if (!msg) { a.classList.add('hidden'); a.textContent = ''; return; } a.textContent = msg; a.className = 'alert ' + (kind || ''); }
+  function modal(html) { $('modalBox').innerHTML = html; $('modal').classList.remove('hidden'); }
+  function closeModal() { $('modal').classList.add('hidden'); $('modalBox').innerHTML = ''; }
+  $('modal').addEventListener('click', function (e) { if (e.target === $('modal')) closeModal(); });
+
+  function showDoc(title, res) {
+    modal('<div class="doc-head"><span class="name">' + esc(title) + '</span><span class="path">保存: ' + esc(res.name || decodeURIComponent(String(res.url).split("/").pop())) + '</span></div>' +
+      '<iframe class="doc-frame" id="docFrame"></iframe>' +
+      '<div class="actions"><button class="btn" id="docClose">閉じる</button></div>');
+    $('docFrame').srcdoc = res.html;
+    $('docClose').onclick = closeModal;
+  }
+
+  /* ---------- 画面切替 ---------- */
+  var titles = { projects: '案件一覧', quotes: '見積', orders: '受注・納品', closing: '締め・請求', masters: 'マスタ' };
+  function showView(name) {
+    document.querySelectorAll('.view').forEach(function (v) { v.classList.toggle('hidden', v.id !== 'view-' + name); });
+    document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.toggle('active', b.dataset.view === name); });
+    $('viewTitle').textContent = titles[name];
+    if (name === 'projects') loadProjects();
+    if (name === 'quotes') loadQuotes();
+    if (name === 'orders') loadOrders();
+    if (name === 'closing') { loadInvoices(); }
+    if (name === 'masters') renderMasters();
+  }
+  document.querySelectorAll('.nav-item').forEach(function (b) { b.addEventListener('click', function () { showView(b.dataset.view); }); });
+  $('btnNewQuote').addEventListener('click', function () { showView('quotes'); resetQuoteForm(); $('qClient').focus(); });
+
+  /* ---------- 起動 ---------- */
+  call('apiBootstrap').then(function (b) {
+    state.user = b.user; state.company = b.company; state.clients = b.clients; state.items = b.items; state.today = b.today;
+    $('companyName').textContent = b.company['名称'] || '';
+    $('userName').textContent = b.user.name;
+    $('userRole').textContent = '権限: ' + b.user.role;
+    $('todayLabel').textContent = b.today;
+    fillClientSelects();
+    $('qDate').value = b.today; $('sDate').value = b.today; $('cCutoff').value = b.today; $('cCutoff').max = b.today;
+    resetQuoteForm();
+    showView('projects');
+  }).catch(function (e) { toast('読み込みに失敗しました: ' + errText(e), 'warn'); });
+
+  function fillClientSelects() {
+    ['qClient', 'dClient'].forEach(function (id) {
+      var s = $(id); s.innerHTML = '<option value="">選んでください</option>';
+      state.clients.forEach(function (c) { var o = el('option', '', c.name + '（' + (c.billing === '随時' ? '随時請求' : '締め ' + c.closingDay + '日') + '）'); o.value = c.id; s.appendChild(o); });
+    });
+    var ps = $('pSupplier'); ps.innerHTML = '<option value="">選んでください</option>';
+    state.clients.forEach(function (c) { var o = el('option', '', c.name); o.value = c.id; ps.appendChild(o); });
+  }
+
+  /* ---------- 案件一覧 ---------- */
+  function loadProjects() {
+    Promise.all([call('apiListProjects'), call('apiSalesSummary'), call('apiListQuotes')]).then(function (r) {
+      var rows = r[0], sum = r[1], quotes = r[2];
+      var thisMonth = state.today.slice(0, 7);
+      var mSales = (sum.months.filter(function (m) { return m.month === thisMonth; })[0] || {}).amount || 0;
+      var open = quotes.filter(function (q) { return q['状態'] === '作成中' || q['状態'] === '提出済'; }).length;
+      var inProgress = rows.filter(function (x) { return x.stage === '受注' || x.stage === '納品・売上計上'; }).length;
+      $('kpis').innerHTML =
+        kpi('今月の売上（税抜）', yen(mSales), '円') + kpi('未請求の売上', sum.unbilled, '件', sum.unbilled > 0) +
+        kpi('提出中の見積', open, '件') + kpi('進行中の案件', inProgress, '件');
+      var tb = $('tblProjects').querySelector('tbody'); tb.innerHTML = '';
+      if (!rows.length) { tb.innerHTML = '<tr class="empty"><td colspan="7">案件はまだありません</td></tr>'; return; }
+      rows.forEach(function (p) {
+        var tr = el('tr');
+        tr.innerHTML = '<td class="mono">' + esc(p.orderNo || p.quoteNo) + (p.orderNo && p.quoteNo ? '<br><span class="hint">' + esc(p.quoteNo) + '</span>' : '') + '</td>' +
+          '<td>' + esc(p.clientName) + '</td><td class="wrap">' + esc(p.title) + '</td><td class="n">' + yen(p.amount) + '</td><td>' + esc(p.date) + '</td>' +
+          '<td>' + steps(p.stage) + '</td><td>' + stageBadge(p.stage) + (p.unbilled ? ' <span class="badge b-warn">未請求 ' + p.unbilled + '</span>' : '') + '</td>';
+        tb.appendChild(tr);
+      });
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+  function kpi(k, v, unit, warn) { return '<div class="kpi' + (warn ? ' warn' : '') + '"><div class="k">' + k + '</div><div class="v">' + v + '<small>' + unit + '</small></div></div>'; }
+  function steps(stage) {
+    var idx = { '見積作成中': 0, '見積提出済': 0, '失注': -1, '受注': 1, '納品・売上計上': 2, '請求済': 3 }[stage];
+    var out = '<span class="steps">';
+    for (var i = 0; i < 4; i++) out += '<i class="' + (idx < 0 ? '' : (i < idx ? 'done' : (i === idx ? 'on' : ''))) + '"></i>';
+    return out + '</span>';
+  }
+  function stageBadge(stage) {
+    var cls = { '見積作成中': 'b-quote', '見積提出済': 'b-quote', '失注': 'b-lost', '受注': 'b-order', '納品・売上計上': 'b-sales', '請求済': 'b-inv' }[stage] || '';
+    return '<span class="badge ' + cls + '">' + esc(stage) + '</span>';
+  }
+
+  /* ---------- 見積 ---------- */
+  function resetQuoteForm() {
+    state.quote = { quoteNo: '', ver: 0, status: '' };
+    $('quoteFormTitle').textContent = '新しい見積';
+    $('quoteFormHint').textContent = '品目を選ぶと単価と税率が入ります';
+    $('qClient').value = ''; $('qTitle').value = ''; $('qDate').value = state.today;
+    ['qClient', 'qTitle'].forEach(function (id) { $(id).classList.remove('bad'); });
+    $('tblLines').querySelector('tbody').innerHTML = '';
+    addLine(); addLine();
+    showAlert('qAlert', '');
+    $('btnQuotePdf').disabled = true; $('btnQuoteOrder').disabled = true;
+    $('btnQuoteSave').textContent = '保存する';
+    $('btnQuoteSave').disabled = false;
+    recalc();
+  }
+  function addLine(l) {
+    l = l || {};
+    var tr = el('tr');
+    var itemOpts = '<option value="">品目を選ぶ</option>' + state.items.map(function (it) { return '<option value="' + esc(it.id) + '"' + (l.itemId === it.id ? ' selected' : '') + '>' + esc(it.name) + '</option>'; }).join('') + '<option value="__free"' + (l.itemId === '' && l.name ? ' selected' : '') + '>（自由入力）</option>';
+    tr.innerHTML = '<td><select class="l-item">' + itemOpts + '</select><input class="l-name hidden" type="text" placeholder="品名" value="' + esc(l.name || '') + '"></td>' +
+      '<td><input class="l-spec" type="text" value="' + esc(l.spec || '') + '"></td>' +
+      '<td><input class="l-qty" type="number" min="0" step="1" value="' + (l.qty != null ? l.qty : '') + '"></td>' +
+      '<td><input class="l-unit" type="text" value="' + esc(l.unit || '') + '"></td>' +
+      '<td><input class="l-price" type="number" min="0" step="1" value="' + (l.price != null ? l.price : '') + '"></td>' +
+      '<td><select class="l-tax"><option value="10"' + (Number(l.taxRate) === 10 || !l.taxRate ? ' selected' : '') + '>10%</option><option value="8"' + (Number(l.taxRate) === 8 ? ' selected' : '') + '>8%</option></select></td>' +
+      '<td class="amt">0</td><td><button class="del" title="行を削除">×</button></td>';
+    $('tblLines').querySelector('tbody').appendChild(tr);
+    var sel = tr.querySelector('.l-item');
+    if (l.itemId === '' && l.name) { tr.querySelector('.l-name').classList.remove('hidden'); }
+    sel.addEventListener('change', function () {
+      var it = state.items.filter(function (x) { return x.id === sel.value; })[0];
+      var nameIn = tr.querySelector('.l-name');
+      if (sel.value === '__free') { nameIn.classList.remove('hidden'); nameIn.focus(); }
+      else { nameIn.classList.add('hidden'); }
+      if (it) {
+        tr.querySelector('.l-spec').value = it.spec || ''; tr.querySelector('.l-unit').value = it.unit || '';
+        tr.querySelector('.l-price').value = it.price; tr.querySelector('.l-tax').value = String(it.taxRate);
+        if (!tr.querySelector('.l-qty').value) tr.querySelector('.l-qty').value = 1;
+      }
+      recalc();
+    });
+    tr.querySelectorAll('input,select').forEach(function (i) { i.addEventListener('input', function () { i.classList.remove('bad'); recalc(); }); });
+    tr.querySelector('.del').addEventListener('click', function () { tr.remove(); recalc(); });
+    return tr;
+  }
+  $('btnAddLine').addEventListener('click', function () { addLine(); });
+
+  function readLines() {
+    return Array.prototype.map.call($('tblLines').querySelectorAll('tbody tr'), function (tr) {
+      var sel = tr.querySelector('.l-item');
+      var it = state.items.filter(function (x) { return x.id === sel.value; })[0];
+      return {
+        itemId: it ? it.id : '', name: it ? it.name : tr.querySelector('.l-name').value, spec: tr.querySelector('.l-spec').value,
+        qty: tr.querySelector('.l-qty').value, unit: tr.querySelector('.l-unit').value, price: tr.querySelector('.l-price').value,
+        taxRate: Number(tr.querySelector('.l-tax').value), _tr: tr
+      };
+    }).filter(function (l) { return l.itemId || l.name || l.qty || l.price; });
+  }
+  function recalc() {
+    var byRate = {};
+    $('tblLines').querySelectorAll('tbody tr').forEach(function (tr) {
+      var q = Number(tr.querySelector('.l-qty').value), p = Number(tr.querySelector('.l-price').value), r = Number(tr.querySelector('.l-tax').value);
+      var amt = (q > 0 && p >= 0 && tr.querySelector('.l-price').value !== '') ? Math.round(q * p) : 0;
+      tr.querySelector('.amt').textContent = yen(amt);
+      byRate[r] = (byRate[r] || 0) + amt;
+    });
+    var sub = 0, tax = 0;
+    Object.keys(byRate).forEach(function (r) { sub += byRate[r]; tax += Math.floor(byRate[r] * Number(r) / 100); });
+    $('tSub').textContent = yen(sub); $('tTax').textContent = yen(tax); $('tTotal').textContent = yen(sub + tax);
+  }
+
+  function quotePayload(force) {
+    var lines = readLines();
+    return { quoteNo: state.quote.quoteNo, clientId: $('qClient').value, title: $('qTitle').value.trim(), date: $('qDate').value, force: !!force,
+      lines: lines.map(function (l) { return { itemId: l.itemId, name: l.name, spec: l.spec, qty: l.qty, unit: l.unit, price: l.price, taxRate: l.taxRate }; }) };
+  }
+  function markBad() {
+    var bad = false;
+    ['qClient', 'qTitle'].forEach(function (id) { var b = !$(id).value; $(id).classList.toggle('bad', b); bad = bad || b; });
+    readLines().forEach(function (l) {
+      var q = l._tr.querySelector('.l-qty'), p = l._tr.querySelector('.l-price');
+      q.classList.toggle('bad', !(Number(q.value) > 0)); p.classList.toggle('bad', p.value === '');
+    });
+    return bad;
+  }
+
+  function saveQuote(force) {
+    markBad();
+    showAlert('qAlert', '');
+    $('btnQuoteSave').disabled = true;
+    return call('apiSaveQuote', quotePayload(force)).then(function (r) {
+      $('btnQuoteSave').disabled = false;
+      if (r.warning) {
+        modal('<h3>同じ見積がありませんか</h3><p>' + esc(r.warning.message) + '</p>' +
+          '<div class="actions"><button class="btn ghost" id="wCancel">戻る</button><button class="btn" id="wRevise">' + esc(r.warning.existing) + ' の改訂版として保存</button><button class="btn primary" id="wForce">別件として保存</button></div>');
+        $('wCancel').onclick = closeModal;
+        $('wForce').onclick = function () { closeModal(); saveQuote(true); };
+        $('wRevise').onclick = function () { closeModal(); state.quote.quoteNo = r.warning.existing; saveQuote(true); };
+        return;
+      }
+      state.quote = { quoteNo: r.quoteNo, ver: r.ver, status: '作成中' };
+      $('quoteFormTitle').textContent = '見積 ' + r.quoteNo + (r.ver > 1 ? '（改訂 ' + r.ver + '）' : '');
+      $('quoteFormHint').textContent = '保存済み。内容を変えて保存すると改訂版になります';
+      $('btnQuoteSave').textContent = '改訂版として保存';
+      $('btnQuotePdf').disabled = false; $('btnQuoteOrder').disabled = false;
+      showAlert('qAlert', '保存しました。見積番号 ' + r.quoteNo + (r.ver > 1 ? '　改訂 ' + r.ver : '') + '　合計 ' + yen(r.totals.total) + ' 円（税込）', 'ok');
+      toast('見積 ' + r.quoteNo + ' を保存しました', 'ok');
+      loadQuotes(true);
+    }).catch(function (e) { $('btnQuoteSave').disabled = false; showAlert('qAlert', errText(e)); });
+  }
+  ['qClient', 'qTitle', 'sOrder', 'dClient', 'dTitle', 'dAmount'].forEach(function (id) { $(id).addEventListener('input', function () { $(id).classList.remove('bad'); }); $(id).addEventListener('change', function () { $(id).classList.remove('bad'); }); });
+  $('btnQuoteSave').addEventListener('click', function () { saveQuote(false); });
+  $('btnQuoteCancel').addEventListener('click', function () { resetQuoteForm(); });
+  $('btnQuotePdf').addEventListener('click', function () {
+    call('apiQuotePdf', state.quote.quoteNo, state.quote.ver).then(function (r) { showDoc('見積書 ' + r.quoteNo, r); loadQuotes(true); }).catch(function (e) { toast(errText(e), 'warn'); });
+  });
+  $('btnQuoteOrder').addEventListener('click', function () { confirmOrder(state.quote.quoteNo); });
+
+  function confirmOrder(quoteNo) {
+    modal('<h3>受注を確定します</h3><p>見積 ' + esc(quoteNo) + ' を受注にして案件番号を付けます。\n見積の明細はそのまま受注・売上・請求へ引き継がれます。</p>' +
+      '<div class="form-grid" style="grid-template-columns:1fr 1fr"><label>受注日<input id="oDate" type="date" value="' + state.today + '"></label><label>納期<input id="oDue" type="date"></label></div>' +
+      '<div class="actions"><button class="btn ghost" id="oCancel">戻る</button><button class="btn accent" id="oOk">受注を確定</button></div>');
+    $('oCancel').onclick = closeModal;
+    $('oOk').onclick = function () {
+      call('apiConfirmOrder', quoteNo, { orderDate: $('oDate').value, due: $('oDue').value }).then(function (r) {
+        closeModal();
+        toast('受注を確定しました。案件番号 ' + r.orderNo, 'ok');
+        showAlert('qAlert', '受注を確定しました。案件番号 ' + r.orderNo + '　受注金額 ' + yen(r.amount) + ' 円（税抜）', 'ok');
+        $('btnQuoteOrder').disabled = true; $('btnQuoteSave').disabled = true;
+        loadQuotes(true);
+      }).catch(function (e) { closeModal(); toast(errText(e), 'warn'); });
+    };
+  }
+
+  function loadQuotes(keepForm) {
+    return call('apiListQuotes').then(function (rows) {
+      var tb = $('tblQuotes').querySelector('tbody'); tb.innerHTML = '';
+      if (!rows.length) { tb.innerHTML = '<tr class="empty"><td colspan="7">見積はまだありません</td></tr>'; return; }
+      rows.forEach(function (q) {
+        var tr = el('tr');
+        var st = q['状態'];
+        tr.innerHTML = '<td class="mono">' + esc(q['見積番号']) + (Number(q['版']) > 1 ? ' <span class="hint">改訂 ' + q['版'] + '</span>' : '') + '</td><td>' + esc(q.clientName) + '</td><td class="wrap">' + esc(q['件名']) + '</td>' +
+          '<td class="n">' + yen(q['合計']) + '</td><td>' + esc(q['見積日']) + '</td>' +
+          '<td><span class="badge ' + ({ '作成中': 'b-quote', '提出済': 'b-quote', '受注': 'b-order', '失注': 'b-lost' }[st] || '') + '">' + esc(st) + (st === '受注' ? ' ' + esc(q['案件番号']) : '') + '</span></td>' +
+          '<td><button class="btn sm" data-act="open">開く</button> <button class="btn sm" data-act="pdf">PDF</button>' + (st !== '受注' && st !== '失注' ? ' <button class="btn sm accent" data-act="order">受注</button>' : '') + '</td>';
+        tr.querySelector('[data-act=open]').onclick = function () { openQuote(q['見積番号']); };
+        tr.querySelector('[data-act=pdf]').onclick = function () { call('apiQuotePdf', q['見積番号'], q['版']).then(function (r) { showDoc('見積書 ' + r.quoteNo, r); loadQuotes(true); }).catch(function (e) { toast(errText(e), 'warn'); }); };
+        var ob = tr.querySelector('[data-act=order]'); if (ob) ob.onclick = function () { confirmOrder(q['見積番号']); };
+        tb.appendChild(tr);
+      });
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+  function openQuote(quoteNo) {
+    call('apiGetQuote', quoteNo).then(function (q) {
+      state.quote = { quoteNo: q['見積番号'], ver: Number(q['版']), status: q['状態'] };
+      $('quoteFormTitle').textContent = '見積 ' + q['見積番号'] + (Number(q['版']) > 1 ? '（改訂 ' + q['版'] + '）' : '');
+      $('quoteFormHint').textContent = q['状態'] === '受注' ? '受注済み（案件 ' + q['案件番号'] + '）。内容は変更できません' : '内容を変えて保存すると改訂版になります';
+      $('qClient').value = q['取引先ID']; $('qTitle').value = q['件名']; $('qDate').value = q['見積日'];
+      $('tblLines').querySelector('tbody').innerHTML = '';
+      q.lines.forEach(function (l) { addLine({ itemId: l['品目ID'], name: l['品名'], spec: l['規格'], qty: l['数量'], unit: l['単位'], price: l['単価'], taxRate: l['税率'] }); });
+      recalc(); showAlert('qAlert', '');
+      $('btnQuoteSave').textContent = '改訂版として保存';
+      $('btnQuoteSave').disabled = q['状態'] === '受注';
+      $('btnQuotePdf').disabled = false; $('btnQuoteOrder').disabled = (q['状態'] === '受注' || q['状態'] === '失注');
+      window.scrollTo(0, 0);
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+
+  /* ---------- 受注・納品 ---------- */
+  function loadOrders() {
+    loadPurchases();
+    call('apiListOrders').then(function (rows) {
+      var tb = $('tblOrders').querySelector('tbody'); tb.innerHTML = '';
+      var sel = $('sOrder'); sel.innerHTML = '<option value="">選んでください</option>';
+      var psel = $('pOrder'); psel.innerHTML = '<option value="">選んでください</option>';
+      rows.forEach(function (o) {
+        if (o['状態'] !== '請求済') {
+          var op2 = el('option', '', o['案件番号'] + '　' + o.clientName + '　' + o['件名']); op2.value = o['案件番号']; psel.appendChild(op2);
+        }
+        if (o['状態'] !== '納品済' && o['状態'] !== '請求済') {
+          var op = el('option', '', o['案件番号'] + '　' + o.clientName + '　' + o['件名'] + '　' + yen(o['金額(税抜)']) + '円'); op.value = o['案件番号']; sel.appendChild(op);
+        }
+        var tr = el('tr');
+        tr.innerHTML = '<td class="mono">' + esc(o['案件番号']) + '</td><td class="mono">' + esc(o['見積番号'] || '（見積なし）') + '</td><td>' + esc(o.clientName) + '</td><td class="wrap">' + esc(o['件名']) + '</td>' +
+          '<td class="n">' + yen(o['金額(税抜)']) + '</td><td class="n">' + yen(o.salesAmount) + (o.unbilled ? ' <span class="badge b-warn">未請求 ' + o.unbilled + '</span>' : '') + '</td><td>' + esc(o['納期']) + '</td>' +
+          '<td><span class="badge ' + ({ '受注': 'b-order', '一部納品': 'b-sales', '納品済': 'b-sales', '請求済': 'b-inv' }[o['状態']] || '') + '">' + esc(o['状態']) + '</span></td>';
+        tb.appendChild(tr);
+      });
+      if (!rows.length) tb.innerHTML = '<tr class="empty"><td colspan="8">受注はまだありません</td></tr>';
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+  function loadPurchases() {
+    call('apiListPurchases').then(function (rows) {
+      var tb = $('tblPurchases').querySelector('tbody'); tb.innerHTML = '';
+      if (!rows.length) { tb.innerHTML = '<tr class="empty"><td colspan="8">発注はまだありません</td></tr>'; return; }
+      rows.slice().reverse().forEach(function (p) {
+        var tr = el('tr');
+        tr.innerHTML = '<td class="mono">' + esc(p['発注番号']) + '</td><td class="mono">' + esc(p['案件番号']) + '</td><td>' + esc(p.supplierName) + '</td><td class="wrap">' + esc(p['内容']) + '</td>' +
+          '<td class="n">' + yen(p['金額(税抜)']) + '</td><td>' + esc(p['発注日']) + '</td><td><span class="badge b-order">' + esc(p['状態']) + '</span></td><td><button class="btn sm" data-po>注文書PDF</button></td>';
+        tr.querySelector('[data-po]').onclick = function () { call('apiPurchasePdf', p['発注番号']).then(function (r) { showDoc('注文書 ' + r.poNo, r); }).catch(function (e) { toast(errText(e), 'warn'); }); };
+        tb.appendChild(tr);
+      });
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+  $('btnPurchase').addEventListener('click', function () {
+    showAlert('pAlert', '');
+    ['pOrder', 'pSupplier', 'pDetail', 'pAmount'].forEach(function (id) { $(id).classList.toggle('bad', !$(id).value); });
+    call('apiAddPurchase', { orderNo: $('pOrder').value, supplierId: $('pSupplier').value, detail: $('pDetail').value.trim(), amount: $('pAmount').value, taxRate: 10 })
+      .then(function (r) { showAlert('pAlert', '発注を登録しました。発注番号 ' + r.poNo + '　一覧の「注文書PDF」から注文書を出せます', 'ok'); toast('発注 ' + r.poNo + ' を登録しました', 'ok'); $('pDetail').value = ''; $('pAmount').value = ''; loadPurchases(); })
+      .catch(function (e) { showAlert('pAlert', errText(e)); });
+  });
+  ['pOrder', 'pSupplier', 'pDetail', 'pAmount', 'uEmail'].forEach(function (id) { $(id).addEventListener('input', function () { $(id).classList.remove('bad'); }); $(id).addEventListener('change', function () { $(id).classList.remove('bad'); }); });
+  $('sFull').addEventListener('change', function () { $('sAmount').disabled = $('sFull').checked; });
+  $('sAmount').disabled = true;
+  $('btnSales').addEventListener('click', function () {
+    showAlert('sAlert', '');
+    if (!$('sOrder').value) { $('sOrder').classList.add('bad'); showAlert('sAlert', '案件を選んでください'); return; }
+    $('sOrder').classList.remove('bad');
+    call('apiRecordSales', { orderNo: $('sOrder').value, date: $('sDate').value, detail: $('sDetail').value, amount: $('sAmount').value, taxRate: 10, full: $('sFull').checked })
+      .then(function (r) { showAlert('sAlert', '売上を計上しました。' + r.salesId + '　' + yen(r.amount) + ' 円（税抜）' + (r.remain > 0 ? '　未計上の残額 ' + yen(r.remain) + ' 円' : '　全額計上済み'), 'ok'); toast('売上を計上しました', 'ok'); $('sDetail').value = ''; $('sAmount').value = ''; loadOrders(); })
+      .catch(function (e) { showAlert('sAlert', errText(e)); });
+  });
+  $('btnDirect').addEventListener('click', function () {
+    showAlert('dAlert', '');
+    ['dClient', 'dTitle', 'dAmount'].forEach(function (id) { $(id).classList.toggle('bad', !$(id).value); });
+    call('apiDirectOrder', { clientId: $('dClient').value, title: $('dTitle').value.trim(), amount: $('dAmount').value, due: $('dDue').value })
+      .then(function (r) { showAlert('dAlert', '受注を登録しました。案件番号 ' + r.orderNo, 'ok'); toast('受注 ' + r.orderNo + ' を登録しました', 'ok'); $('dTitle').value = ''; $('dAmount').value = ''; loadOrders(); })
+      .catch(function (e) { showAlert('dAlert', errText(e)); });
+  });
+
+  /* ---------- 締め・請求 ---------- */
+  $('btnClosingPreview').addEventListener('click', function () {
+    var cutoff = $('cCutoff').value;
+    $('cIssued').classList.add('hidden'); $('cIssued').innerHTML = '';
+    call('apiClosingPreview', cutoff).then(function (p) {
+      state.closing = p;
+      var tb = $('tblClosing').querySelector('tbody'); tb.innerHTML = '';
+      $('tblClosing').classList.remove('hidden');
+      if (!p.groups.length) {
+        tb.innerHTML = '<tr class="empty"><td colspan="7">締め日 ' + esc(cutoff) + ' までの請求対象はありません</td></tr>';
+        $('cMsg').textContent = '請求対象 0 件'; $('btnIssue').disabled = true;
+      } else {
+        p.groups.forEach(function (g) {
+          var tr = el('tr');
+          tr.innerHTML = '<td>' + esc(g.clientName) + '</td><td><span class="badge ' + (g.mode === '随時' ? 'b-sales' : 'b-quote') + '">' + esc(g.mode === '随時' ? '随時請求' : '締め請求') + '</span></td><td>' + esc(g.period) + '</td>' +
+            '<td class="n">' + g.lines.length + '</td><td class="n">' + yen(g.subtotal) + '</td><td class="n">' + yen(g.tax) + '</td><td class="n"><b>' + yen(g.total) + '</b></td>';
+          tb.appendChild(tr);
+        });
+        var total = p.groups.reduce(function (a, g) { return a + g.total; }, 0);
+        $('cMsg').textContent = '請求対象 ' + p.groups.length + ' 件　合計 ' + yen(total) + ' 円（税込）';
+        $('btnIssue').disabled = false;
+      }
+      var sk = $('cSkipped');
+      if (p.skipped.length) { sk.classList.remove('hidden'); sk.innerHTML = '<b>今回は対象外 ' + p.skipped.length + ' 件</b>　' + p.skipped.map(function (s) { return esc(s.reason) + '（' + esc(s.salesId) + '）'; }).join('　'); }
+      else { sk.classList.add('hidden'); sk.innerHTML = ''; }
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  });
+  $('btnIssue').addEventListener('click', function () {
+    var cutoff = $('cCutoff').value;
+    $('btnIssue').disabled = true;
+    call('apiIssueInvoices', cutoff).then(function (r) {
+      var box = $('cIssued'); box.innerHTML = ''; box.classList.remove('hidden');
+      if (!r.issued.length) { box.innerHTML = '<div class="alert info">' + esc(r.message) + '</div>'; }
+      r.issued.forEach(function (i) {
+        var row = el('div', 'row');
+        row.innerHTML = '<span class="no">' + esc(i.invNo) + '</span><span>' + esc(i.clientName) + '</span><span class="hint">' + i.lines + ' 件</span><span class="amt">' + yen(i.total) + ' 円</span><button class="btn sm" data-inv>PDFを見る</button>';
+        row.querySelector('[data-inv]').onclick = function () { showDoc('請求書 ' + i.invNo, i); };
+        box.appendChild(row);
+      });
+      $('cMsg').textContent = r.message;
+      toast(r.message, r.issued.length ? 'ok' : '');
+      $('tblClosing').querySelector('tbody').innerHTML = '';
+      $('tblClosing').classList.add('hidden'); $('cSkipped').classList.add('hidden');
+      loadInvoices();
+      if (r.issued.length) showDoc('請求書 ' + r.issued[0].invNo, r.issued[0]);
+    }).catch(function (e) { $('btnIssue').disabled = false; toast(errText(e), 'warn'); });
+  });
+  function loadInvoices() {
+    call('apiListInvoices').then(function (rows) {
+      var tb = $('tblInvoices').querySelector('tbody'); tb.innerHTML = '';
+      if (!rows.length) { tb.innerHTML = '<tr class="empty"><td colspan="8">請求書はまだありません</td></tr>'; return; }
+      rows.forEach(function (i) {
+        var tr = el('tr');
+        tr.innerHTML = '<td class="mono">' + esc(i['請求番号']) + '</td><td>' + esc(i.clientName) + '</td><td>' + esc(i['請求方式'] === '随時' ? '随時請求' : '締め請求') + '</td><td>' + esc(i['対象期間']) + '</td>' +
+          '<td class="n">' + yen(i['合計']) + '</td><td>' + esc(i['発行日']) + '</td><td>' + esc(i['支払期限']) + '</td><td>' + (i['PDF'] ? '<button class="btn sm" data-pdf>PDF</button>' : '<span class="hint">—</span>') + '</td>';
+        var b = tr.querySelector('[data-pdf]'); if (b) b.onclick = function () { call('apiInvoicePdf', i['請求番号']).then(function (r) { showDoc('請求書 ' + r.invNo, r); }).catch(function (e) { toast(errText(e), 'warn'); }); };
+        tb.appendChild(tr);
+      });
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+
+  /* ---------- マスタ ---------- */
+  function loadUsers() {
+    call('apiListUsers').then(function (rows) {
+      var tu = $('tblUsers').querySelector('tbody'); tu.innerHTML = '';
+      if (!rows.length) { tu.innerHTML = '<tr class="empty"><td colspan="3">利用者が未登録の間は、開いた人全員が入力できます。最初に管理者を1人登録してください</td></tr>'; return; }
+      rows.forEach(function (u) {
+        var tr = el('tr'); tr.innerHTML = '<td>' + esc(u.email) + '</td><td>' + esc(u.name) + '</td><td><span class="badge ' + ({ '管理': 'b-inv', '入力': 'b-order', '閲覧': '' }[u.role] || '') + '">' + esc(u.role) + '</span></td>'; tu.appendChild(tr);
+      });
+    }).catch(function (e) { toast(errText(e), 'warn'); });
+  }
+  $('btnUser').addEventListener('click', function () {
+    showAlert('uAlert', '');
+    $('uEmail').classList.toggle('bad', !$('uEmail').value);
+    call('apiSaveUser', { email: $('uEmail').value.trim(), name: $('uName').value.trim(), role: $('uRole').value })
+      .then(function (r) { showAlert('uAlert', '登録しました: ' + r.email, 'ok'); $('uEmail').value = ''; $('uName').value = ''; loadUsers(); })
+      .catch(function (e) { showAlert('uAlert', errText(e)); });
+  });
+  function renderMasters() {
+    loadUsers();
+    var tc = $('tblClients').querySelector('tbody'); tc.innerHTML = '';
+    state.clients.forEach(function (c) {
+      var tr = el('tr'); tr.innerHTML = '<td class="mono">' + esc(c.id) + '</td><td>' + esc(c.name) + '</td><td>' + esc(c.closingDay === '末' ? '月末' : c.closingDay + '日') + '</td><td>' + esc(c.terms) + '</td><td>' + esc(c.billing === '随時' ? '随時請求' : '締め請求') + '</td>'; tc.appendChild(tr);
+    });
+    var ti = $('tblItems').querySelector('tbody'); ti.innerHTML = '';
+    state.items.forEach(function (it) {
+      var tr = el('tr'); tr.innerHTML = '<td class="mono">' + esc(it.id) + '</td><td>' + esc(it.name) + '</td><td>' + esc(it.spec) + '</td><td>' + esc(it.unit) + '</td><td class="n">' + yen(it.price) + '</td><td>' + it.taxRate + '%</td>'; ti.appendChild(tr);
+    });
+  }
+})();
+</script>

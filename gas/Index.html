@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <base target="_top">
+  <title>受発注・売上・請求管理</title>
+  <?!= include('style_css') ?>
+</head>
+<body>
+  <div id="app">
+    <aside class="nav">
+      <div class="brand">
+        <div class="brand-name" id="companyName">…</div>
+        <div class="brand-sub">受発注・売上・請求管理</div>
+      </div>
+      <nav>
+        <button class="nav-item active" data-view="projects"><span class="ic">▤</span>案件一覧</button>
+        <button class="nav-item" data-view="quotes"><span class="ic">✎</span>見積</button>
+        <button class="nav-item" data-view="orders"><span class="ic">▣</span>受注・納品</button>
+        <button class="nav-item" data-view="closing"><span class="ic">¥</span>締め・請求</button>
+        <button class="nav-item" data-view="masters"><span class="ic">≡</span>マスタ</button>
+      </nav>
+      <div class="user">
+        <div class="user-name" id="userName">…</div>
+        <div class="user-role" id="userRole">…</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h1 id="viewTitle">案件一覧</h1>
+        <div class="topbar-right">
+          <span class="today" id="todayLabel"></span>
+          <button class="btn primary" id="btnNewQuote">＋ 見積を作る</button>
+        </div>
+      </header>
+
+      <section class="view" id="view-projects">
+        <div class="kpis" id="kpis"></div>
+        <div class="card">
+          <div class="card-head"><h2>案件の進み具合</h2><span class="hint">見積 → 受注 → 納品 → 請求</span></div>
+          <table class="tbl" id="tblProjects">
+            <thead><tr><th>案件 / 見積</th><th>取引先</th><th>件名</th><th class="n">金額（税抜）</th><th>受注日 / 見積日</th><th>進み具合</th><th>状態</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-quotes">
+        <div class="card" id="quoteFormCard">
+          <div class="card-head"><h2 id="quoteFormTitle">新しい見積</h2><span class="hint" id="quoteFormHint">品目を選ぶと単価と税率が入ります</span></div>
+          <div class="form-grid">
+            <label><span class="cap">取引先 <span class="req">必須</span></span>
+              <select id="qClient"><option value="">選んでください</option></select>
+            </label>
+            <label><span class="cap">件名 <span class="req">必須</span></span>
+              <input id="qTitle" type="text" placeholder="例: 倉庫内 配管更新工事">
+            </label>
+            <label>見積日
+              <input id="qDate" type="date">
+            </label>
+          </div>
+          <table class="tbl lines" id="tblLines">
+            <thead><tr><th style="width:34%">品目</th><th>規格</th><th class="n" style="width:9%">数量</th><th style="width:8%">単位</th><th class="n" style="width:13%">単価</th><th style="width:8%">税率</th><th class="n" style="width:14%">金額</th><th style="width:4%"></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="lines-foot">
+            <button class="btn ghost" id="btnAddLine">＋ 明細を追加</button>
+            <div class="totals">
+              <div><span>小計（税抜）</span><b id="tSub">0</b></div>
+              <div><span>消費税</span><b id="tTax">0</b></div>
+              <div class="grand"><span>合計（税込）</span><b id="tTotal">0</b></div>
+            </div>
+          </div>
+          <div class="alert hidden" id="qAlert"></div>
+          <div class="actions">
+            <button class="btn ghost" id="btnQuoteCancel">閉じる</button>
+            <button class="btn primary" id="btnQuoteSave">保存する</button>
+            <button class="btn" id="btnQuotePdf" disabled>見積書PDF</button>
+            <button class="btn accent" id="btnQuoteOrder" disabled>受注を確定</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>見積一覧</h2><span class="hint">最新版だけを表示</span></div>
+          <table class="tbl" id="tblQuotes">
+            <thead><tr><th>見積番号</th><th>取引先</th><th>件名</th><th class="n">合計（税込）</th><th>見積日</th><th>状態</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-orders">
+        <div class="two">
+          <div class="card">
+            <div class="card-head"><h2>納品を登録して売上を計上</h2><span class="hint">全額か、一部の金額を入れる</span></div>
+            <div class="form-grid">
+              <label><span class="cap">案件 <span class="req">必須</span></span>
+                <select id="sOrder"><option value="">選んでください</option></select>
+              </label>
+              <label>納品日
+                <input id="sDate" type="date">
+              </label>
+              <label>内容
+                <input id="sDetail" type="text" placeholder="空なら件名を使います">
+              </label>
+              <label>金額（税抜）
+                <div class="inline">
+                  <input id="sAmount" type="number" min="0" step="1" placeholder="一部納品のとき">
+                  <label class="chk"><input id="sFull" type="checkbox" checked> 残額を全額計上</label>
+                </div>
+              </label>
+            </div>
+            <div class="alert hidden" id="sAlert"></div>
+            <div class="actions"><button class="btn primary" id="btnSales">売上を計上</button></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>見積なしの受注</h2><span class="hint">電話や口頭の注文をそのまま登録</span></div>
+            <div class="form-grid">
+              <label><span class="cap">取引先 <span class="req">必須</span></span>
+                <select id="dClient"><option value="">選んでください</option></select>
+              </label>
+              <label><span class="cap">件名 <span class="req">必須</span></span>
+                <input id="dTitle" type="text">
+              </label>
+              <label><span class="cap">金額（税抜） <span class="req">必須</span></span>
+                <input id="dAmount" type="number" min="0" step="1">
+              </label>
+              <label>納期
+                <input id="dDue" type="date">
+              </label>
+            </div>
+            <div class="alert hidden" id="dAlert"></div>
+            <div class="actions"><button class="btn primary" id="btnDirect">受注を登録</button></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>仕入先・外注先への発注</h2><span class="hint">受注案件に紐付けて登録し、注文書PDFを出す</span></div>
+          <div class="form-grid" style="grid-template-columns:1.4fr 1fr 1.2fr .8fr">
+            <label><span class="cap">案件 <span class="req">必須</span></span>
+              <select id="pOrder"><option value="">選んでください</option></select>
+            </label>
+            <label><span class="cap">仕入先 <span class="req">必須</span></span>
+              <select id="pSupplier"><option value="">選んでください</option></select>
+            </label>
+            <label><span class="cap">内容 <span class="req">必須</span></span>
+              <input id="pDetail" type="text" placeholder="例: 配管部材セット 2式">
+            </label>
+            <label><span class="cap">金額（税抜） <span class="req">必須</span></span>
+              <input id="pAmount" type="number" min="0" step="1">
+            </label>
+          </div>
+          <div class="alert hidden" id="pAlert"></div>
+          <div class="actions"><button class="btn primary" id="btnPurchase">発注を登録</button></div>
+          <table class="tbl" id="tblPurchases">
+            <thead><tr><th>発注番号</th><th>案件番号</th><th>仕入先</th><th>内容</th><th class="n">金額（税抜）</th><th>発注日</th><th>状態</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>受注一覧</h2></div>
+          <table class="tbl" id="tblOrders">
+            <thead><tr><th>案件番号</th><th>見積番号</th><th>取引先</th><th>件名</th><th class="n">受注金額（税抜）</th><th class="n">売上計上</th><th>納期</th><th>状態</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-closing">
+        <div class="card">
+          <div class="card-head"><h2>締め処理</h2><span class="hint">取引先ごとの締め日で、未請求の売上をまとめます</span></div>
+          <div class="closing-bar">
+            <label>締め日 <input id="cCutoff" type="date"></label>
+            <button class="btn" id="btnClosingPreview">対象を確認</button>
+            <button class="btn primary" id="btnIssue" disabled>請求書を発行</button>
+            <span class="closing-msg" id="cMsg"></span>
+          </div>
+          <table class="tbl hidden" id="tblClosing">
+            <thead><tr><th>取引先</th><th>請求方式</th><th>対象</th><th class="n">件数</th><th class="n">税抜</th><th class="n">消費税</th><th class="n">税込</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="skipped hidden" id="cSkipped"></div>
+          <div class="issued hidden" id="cIssued"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>発行済み請求書</h2></div>
+          <table class="tbl" id="tblInvoices">
+            <thead><tr><th>請求番号</th><th>取引先</th><th>請求方式</th><th>対象</th><th class="n">合計（税込）</th><th>発行日</th><th>支払期限</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view hidden" id="view-masters">
+        <div class="two">
+          <div class="card">
+            <div class="card-head"><h2>取引先</h2></div>
+            <table class="tbl" id="tblClients">
+              <thead><tr><th>ID</th><th>名称</th><th>締め日</th><th>支払条件</th><th>請求方式</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>品目・単価</h2></div>
+            <table class="tbl" id="tblItems">
+              <thead><tr><th>ID</th><th>品名</th><th>規格</th><th>単位</th><th class="n">標準単価</th><th>税率</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>利用者と権限</h2><span class="hint">管理: 利用者の変更ができる ／ 入力: 登録と発行 ／ 閲覧: 見るだけ</span></div>
+          <table class="tbl" id="tblUsers">
+            <thead><tr><th>メール</th><th>表示名</th><th>権限</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="form-grid" style="margin-top:12px">
+            <label><span class="cap">メール <span class="req">必須</span></span><input id="uEmail" type="text" placeholder="name@example.jp"></label>
+            <label>表示名<input id="uName" type="text"></label>
+            <label>権限<select id="uRole"><option value="入力">入力</option><option value="閲覧">閲覧</option><option value="管理">管理</option></select></label>
+          </div>
+          <div class="alert hidden" id="uAlert"></div>
+          <div class="actions"><button class="btn primary" id="btnUser">利用者を追加・変更</button></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal hidden" id="modal">
+    <div class="modal-box" id="modalBox"></div>
+  </div>
+  <div class="toast hidden" id="toast"></div>
+
+  <?!= include('app_js') ?>
+</body>
+</html>
